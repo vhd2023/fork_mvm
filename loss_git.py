@@ -5,8 +5,11 @@ import torch.nn as nn
 import math
 
 def log_it(*args, **kwargs):
-    with open("c_neg_logit=====LOG=====min_mean_stats.out", "a") as f:
+    with open("colog/logit==Loss===LOG=====instance-shapes.out", "a") as f:
         print(*args, **kwargs, file=f)
+        info = torch.cuda.mem_get_info(device="cuda:0")
+        info = [bytes // (10 ** 6) for bytes in info]
+        print("####\t\t#### free gpu:", info[0], "Mb\t", "occupied:", info[1], "Mb", file=f)
 
 class ContrastiveLoss(nn.Module):
     def __init__(self, batch_size, confidence_bs, class_num, temperature_ins, temperature_clu, device):
@@ -20,9 +23,9 @@ class ContrastiveLoss(nn.Module):
         # self.stats = open("c_neg_logit_min_mean_stats.out", "a")
         
 
-        self.mask_ins = self.mask_correlated(batch_size)
-        self.mask_clu = self.mask_correlated(class_num)
-        self.criterion = nn.CrossEntropyLoss(reduction="sum")
+        self.mask_ins     = None #self.mask_correlated(batch_size)
+        self.mask_clu     = self.mask_correlated(class_num)
+        self.criterion    = nn.CrossEntropyLoss(reduction="sum")
         self.similarity_f = nn.CosineSimilarity(dim=2)
 
     def mask_correlated(self, size):
@@ -334,8 +337,9 @@ class ContrastiveLoss(nn.Module):
         log_it(f"batch loss: {batch_loss.item():.4f} / instance loss:{instance_loss.item():.4f} / cluster loss:{(cluster_loss + ne_loss).item():.4f} / ")
         return instance_loss, cluster_loss + ne_loss        #, mask
     
-    
-    def forward(self, z_i, z_j, c_i, c_j, pseudo_labels, pseudo_labels_oc):
+
+     
+    def forward1(self, z_i, z_j, c_i, c_j):
         # Entropy Loss
         p_i = c_i.sum(0).view(-1)
         p_i /= p_i.sum()
@@ -354,38 +358,115 @@ class ContrastiveLoss(nn.Module):
         sim_i_j = torch.diag(sim, self.class_num)
         sim_j_i = torch.diag(sim, -self.class_num)
 
-
-        def get_diag(sim, class_num, contrast_count):
-            N = class_num * 2
-            #length = sim.shape[0]
-            # n_levels = contrast_count - 1
-            pairs = []
-            levs = [[] for _ in range(contrast_count)]
-            for level in range(1, contrast_count, 2):
-    
-                pdiag = torch.diag(sim, level * class_num)
-                ndiag = torch.diag(sim, -level * class_num)
-                pchunks = torch.split(pdiag, class_num)
-                nchunks = torch.split(ndiag, class_num)
-                k = 1
-                for i, (pos, neg) in enumerate(zip(pchunks, nchunks), start=1):
-                    levs[i].append(pos)
-                    levs[i + k].append(neg)
-                    k += 2
-            for lev_diags in levs:
-                pairs += lev_diags
-            pairs
-
-
         positive_clusters = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
         negative_clusters = sim[self.mask_clu].reshape(N, -1)
         labels = torch.zeros(N).to(positive_clusters.device).long()
         logits = torch.cat((positive_clusters, negative_clusters), dim=1)
         cluster_loss = self.criterion(logits, labels)
         cluster_loss /= N
+        del logits, labels, positive_clusters, negative_clusters, sim, sim_i_j, sim_j_i, c, c_i, c_j, p_j, p_i
         
-        mask = torch.eye(self.batch_size).bool().to(self.device)
+
+        contrast_count = 2
+        device = z_i.device
+        batch_size = 20000
+
+        contrast_feature = torch.cat((z_i, z_j), dim=0) #.cpu() 5859 8310 4942 1604 
+        
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        # compute logits
+        torch.cuda.empty_cache()
+        log_it("anchor_feature:", anchor_feature.shape)
+
+        product_out = chunked_matmul(anchor_feature, contrast_feature.T, chunk_size=1000, device=device)
+        del anchor_feature, contrast_feature
+        log_it("product_out:", product_out.shape)
+        torch.cuda.empty_cache()
+        anchor_dot_contrast = torch.div(product_out, self.temperature_ins)
+        del product_out
+
+        # anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.temperature_ins)
+        log_it("anchor_dot_contrast:", anchor_dot_contrast.shape)
+
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        torch.cuda.empty_cache()
+
+        logits = (anchor_dot_contrast - logits_max.detach())#.to('cuda')
+        del anchor_dot_contrast, logits_max
+        log_it("logits:", logits.shape)
+
+        torch.cuda.empty_cache()
+
+        mask = torch.eye(batch_size).bool().to(device)
         mask = mask.float()
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(torch.ones_like(mask), 1,
+                                    torch.arange(batch_size * anchor_count).view(-1, 1).to(device), 0)
+        log_it("logits_mask:", logits_mask.shape)
+
+        mask = mask * logits_mask
+        log_it("mask:", mask.shape)
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        del logits_mask
+
+        log_it("exp_logits:", exp_logits.shape)
+
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        log_it("log_prob:", log_prob.shape)
+
+        del logits, exp_logits
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        log_it("mean_log_prob_pos:", mean_log_prob_pos.shape)
+
+        del mask, log_prob
+        # loss
+        instance_loss = - mean_log_prob_pos
+        instance_loss = instance_loss.view(anchor_count, batch_size).mean()
+        return instance_loss, cluster_loss + ne_loss
+
+    def forward(self, z_i, z_j, c_i, c_j):
+        batch_size = z_i.shape[0]
+        device = z_i.device
+        # Entropy Loss
+        p_i = c_i.sum(0).view(-1)
+        p_i /= p_i.sum()
+        ne_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i)).sum()
+        p_j = c_j.sum(0).view(-1)
+        p_j /= p_j.sum()
+        ne_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j)).sum()
+        ne_loss = ne_i + ne_j
+
+        # Cluster Loss
+        c_i = c_i.t()
+        c_j = c_j.t()
+        N = 2 * self.class_num
+        c = torch.cat((c_i, c_j), dim=0)
+        # print(c.unsqueeze(1).shape, c.unsqueeze(0).shape)
+
+        sim = self.similarity_f(c.unsqueeze(1), c.unsqueeze(0)) / self.temperature_clu
+        sim_i_j = torch.diag(sim, self.class_num)
+        sim_j_i = torch.diag(sim, -self.class_num)
+        positive_clusters = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
+        negative_clusters = sim[self.mask_clu].reshape(N, -1)
+        labels = torch.zeros(N).to(positive_clusters.device).long()
+        logits = torch.cat((positive_clusters, negative_clusters), dim=1)
+        cluster_loss = self.criterion(logits, labels)
+        cluster_loss /= N
+
+        del logits, labels, positive_clusters, negative_clusters, sim, sim_i_j, sim_j_i, c, c_i, c_j, p_j, p_i
+
+
+        mask = torch.eye(batch_size).bool().to(self.device)
+        mask = mask.float()
+        torch.cuda.empty_cache()
 
         contrast_count = 2
         contrast_feature = torch.cat((z_i, z_j), dim=0)
@@ -395,29 +476,47 @@ class ContrastiveLoss(nn.Module):
 
         # compute logits
         anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.temperature_ins)
+        torch.cuda.empty_cache()
+
+        # del anchor_feature, contrast_feature
+
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
-        logits = anchor_dot_contrast - logits_max.detach()
+        torch.cuda.empty_cache()
 
+        logits = anchor_dot_contrast - logits_max.detach()
+        # del logits_max, anchor_dot_contrast
         # tile mask
         mask = mask.repeat(anchor_count, contrast_count)
+        torch.cuda.empty_cache()
+
         # mask-out self-contrast cases
         logits_mask = torch.scatter(torch.ones_like(mask), 1,
-                                    torch.arange(self.batch_size * anchor_count).view(-1, 1).to(self.device), 0)
+                                    torch.arange(batch_size * anchor_count).view(-1, 1).to(self.device), 0)
         mask = mask * logits_mask
         
+        torch.cuda.empty_cache()
+
         # compute log_prob
         exp_logits = torch.exp(logits) * logits_mask
+        # del logits_mask
+        torch.cuda.empty_cache()
+
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        # del logits, exp_logits
 
         # compute mean of log-likelihood over positive
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        torch.cuda.empty_cache()
 
+        # del mask, log_prob
         # loss
         instance_loss = - mean_log_prob_pos
-        instance_loss = instance_loss.view(anchor_count, self.batch_size).mean()
+        # del mean_log_prob_pos
+        instance_loss = instance_loss.view(anchor_count, batch_size).mean()
 
         return instance_loss, cluster_loss + ne_loss
+
 
     def forward_instance_elim(self, z_i, z_j, pseudo_labels):
         # instance loss
@@ -463,7 +562,7 @@ class ContrastiveLoss(nn.Module):
 
         # compute mean of log-likelihood over positive
         mean_log_prob_pos = (mask_eye * log_prob).sum(1) / mask_eye.sum(1)
-
+#60379975  5264 1293
         # loss
         instance_loss = -mean_log_prob_pos
         instance_loss = instance_loss.view(anchor_count,
@@ -472,7 +571,108 @@ class ContrastiveLoss(nn.Module):
         return instance_loss
 
 
+
+
 '''
+
+
+    def mask_correlated(self, size):
+        N = 2 * size
+        mask = torch.ones((N, N)).to(self.device)
+        mask = mask.fill_diagonal_(0)
+        for i in range(size):
+            mask[i, size + i] = 0
+            mask[size + i, i] = 0
+        mask = mask.bool()
+        return mask
+
+    def generate_pseudo_labels(self, c, class_num):
+        pseudo_label = -torch.ones(self.confidence_bs, dtype=torch.long).to(self.device)
+        tmp = torch.arange(0, self.confidence_bs).to(self.device)
+        with torch.no_grad():
+            prediction = c.argmax(dim=1)
+            confidence = c.max(dim=1).values
+            pseudo_per_class = math.ceil(self.confidence_bs / class_num * 0.5)
+            for i in range(class_num):
+                class_idx = (prediction == i)
+                confidence_class = confidence[class_idx]
+                num = min(confidence_class.shape[0], pseudo_per_class)
+                confident_idx = torch.argsort(-confidence_class)
+                for j in range(num):
+                    idx = tmp[class_idx][confident_idx[j]]
+                    pseudo_label[idx] = i
+        return pseudo_label
+
+
+    def forward_weighted_ce(self, c_, pseudo_label, class_num):
+        idx, counts = torch.unique(pseudo_label, return_counts=True)
+        freq = pseudo_label.shape[0] / counts.float()
+        weight = torch.ones(class_num).to(pseudo_label.device)
+        weight[idx] = freq
+        criterion = nn.CrossEntropyLoss(weight=weight)
+        loss_ce = criterion(c_, pseudo_label)
+        return loss_ce
+
+    def forward(self, z_i, z_j, c_i, c_j, pseudo_labels, pseudo_labels_oc):
+        # Entropy Loss
+        p_i = c_i.sum(0).view(-1)
+        p_i /= p_i.sum()
+        ne_i = math.log(p_i.size(0)) + (p_i * torch.log(p_i)).sum()
+        p_j = c_j.sum(0).view(-1)
+        p_j /= p_j.sum()
+        ne_j = math.log(p_j.size(0)) + (p_j * torch.log(p_j)).sum()
+        ne_loss = ne_i + ne_j
+
+        # Cluster Loss
+        c_i = c_i.t()
+        c_j = c_j.t()
+        N = 2 * self.class_num
+        c = torch.cat((c_i, c_j), dim=0)
+        sim = self.similarity_f(c.unsqueeze(1), c.unsqueeze(0)) / self.temperature_clu
+        sim_i_j = torch.diag(sim, self.class_num)
+        sim_j_i = torch.diag(sim, -self.class_num)
+        positive_clusters = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
+        negative_clusters = sim[self.mask_clu].reshape(N, -1)
+        labels = torch.zeros(N).to(positive_clusters.device).long()
+        logits = torch.cat((positive_clusters, negative_clusters), dim=1)
+        cluster_loss = self.criterion(logits, labels)
+        cluster_loss /= N
+
+        mask = torch.eye(self.batch_size).bool().to(self.device)
+        mask = mask.float()
+
+        contrast_count = 2
+        contrast_feature = torch.cat((z_i, z_j), dim=0)
+
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        # compute logits
+        anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.temperature_ins)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(torch.ones_like(mask), 1,
+                                    torch.arange(self.batch_size * anchor_count).view(-1, 1).to(self.device), 0)
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        instance_loss = - mean_log_prob_pos
+        instance_loss = instance_loss.view(anchor_count, self.batch_size).mean()
+
+        return instance_loss, cluster_loss + ne_loss
+
     
     def forward2(z_i, z_j, c_i, c_j, z_k=None, z_l=None, c_k=None, c_l=None, contrast_count=2, class_num=2):
         # Entropy Loss
@@ -563,9 +763,83 @@ class ContrastiveLoss(nn.Module):
 
         return instance_loss, cluster_loss + ne_loss
 
+
+def batched_matrix_multi2(tensor_data, chunk_size=2000):
+
+    # Sample data sizes
+    num_samples, embedding_size = tensor_data.shape #40000
+    #embedding_size = 128
+    # chunk_size = 2000  # Split the data into chunks of 2000 samples
+
+    # Generate some random data for demonstration
+    tensor_data = torch.rand(num_samples, embedding_size)#.cuda()
+
+    # Initialize an empty tensor to store the result
+    result = torch.empty(num_samples, num_samples)#.cuda()
+
+    # Compute matrix multiplication in chunks
+    for i in range(0, num_samples, chunk_size):
+        start_idx = i
+        end_idx = min(i + chunk_size, num_samples)
+
+        # Select a chunk of data
+        chunk = tensor_data[start_idx:end_idx]
+
+        # Compute matrix multiplication for the chunk and store the result
+        partial_result = torch.matmul(chunk, tensor_data.T)
+
+        # Place the partial result in the correct position in the final result tensor
+        result[start_idx:end_idx, :] = partial_result
+
+    # Now, 'result' contains the matrix multiplication of tensor_data with its transpose
+    return result
+
+def batched_matrix_multi(A, batch_size = 1024):
+    # Input tensors
+    # A = torch.randn(40000, 128) 
+    B = A.t()#transpose(0, 1)
+
+    # Batch size
+    
+    # Number of batches 
+    num_batches = A.shape[0] // batch_size
+
+    # Output tensor 
+    C = torch.empty(A.shape[0], A.shape[0], dtype=A.dtype, device=A.device)
+
+    for i in range(num_batches):
+
+        # Batch slices
+        A_batch = A[i*batch_size:(i+1)*batch_size]  
+        B_batch = B[:, i*batch_size:(i+1)*batch_size]
+
+        # Batched multiplication
+        C_batch = torch.matmul(A_batch, B_batch)
+
+        # Write to output tensor
+        C[i*batch_size:(i+1)*batch_size, i*batch_size:(i+1)*batch_size] = C_batch
+    return C
+
 '''
+def chunked_matmul(A, B, chunk_size, device): 
+    # Split matrices A and B into smaller chunks
+    # B = A.t() 
+    A_chunks = torch.split(A, chunk_size, dim=1) 
+    B_chunks = torch.split(B, chunk_size, dim=0) 
+    # Multiply each chunk of A with the corresponding chunk of B 
+    C_chunks = [] 
+    torch.cuda.empty_cache()
+    for i in range(len(A_chunks)): 
 
+        C_chunk = torch.mm(A_chunks[i], B_chunks[i]) 
+        C_chunks.append(C_chunk) 
+        # Concatenate the resulting chunks to form the final matrix 
+    C = torch.cat(C_chunks, dim=1).to(device)
+    torch.cuda.empty_cache()
 
+    return C 
+    # Example usage A = torch.randn(10000, 5000) B = torch.randn(5000, 10000) C = chunked_matmul(A, B, 1000)
+    
 def get_diag(sim, class_num, contrast_count):
     #N = class_num * 2
     #length = sim.shape[0]
@@ -607,26 +881,102 @@ def get_diag(sim, class_num, contrast_count):
     return torch.cat(pairs, dim=0)
 
 if __name__ == "__main__":
-    contrast_count = 8
-    class_num =  20
-    N = class_num * contrast_count
-    ts = []
-    squares = contrast_count * contrast_count
-    
-    for i in range(1, squares + 1):
-        tens = torch.ones(class_num) * i
-        a = torch.diag(tens)
-        #print(i, a.shape, end="\n\n")
-        ts.append(a)
-    ts = [torch.cat(ts[s:s + contrast_count], dim=1) for s in range(0, len(ts), contrast_count)]
-    # print(len(ts), ts[0].shape, end="\n\n")
-    # print(*ts, sep="\n\n", end="\n**##########################***\n\n")
-    sim = torch.cat(ts, dim=0)
-    print(sim.shape)
-    print(sim)
+    def are_tensors_approximately_equal(tensor1, tensor2, tolerance=1e-6):
+        # Check if the shapes of the tensors are the same
+        if tensor1.shape != tensor2.shape:
+            return False
 
-    out = get_diag(sim, class_num, contrast_count)
-    print(sim)
-    print(sim.shape)
-    print(out.shape)
-    print(out)
+    # Check if the absolute difference between corresponding elements is within the tolerance
+        elementwise_difference = torch.abs(tensor1 - tensor2)
+        return torch.all(elementwise_difference < tolerance)
+    
+    A = torch.rand(1000, 50)
+    # R1 = batched_matrix_multi(A)
+    # R2 = batched_matrix_multi2(A)
+    R4 = chunked_matmul(A, chunk_size=200)
+    # r = are_tensors_approximately_equal(R1, R2)
+    import numpy as np
+    # try:
+    #     print("1111111111111111111111111111111111", R1.shape, R2.shape)
+    #     np.testing.assert_allclose(R1, R2, rtol=1e-5, atol=1e-8)
+    # except Exception as e:
+    #     pass
+    #     #print(e)
+    
+    R3 = torch.matmul(A, A.t())
+
+    # try:
+    #     print("22222222222222222222222222222222222", R3.shape, R1.shape)
+    #     np.testing.assert_allclose(R3, R1, rtol=1e-5, atol=1e-8)
+    # except Exception as e:
+    #     pass
+    #     #print(e)
+
+
+    # try:
+    #     print("33333333333333333333333333333333333", R3.shape, R2.shape)
+    #     np.testing.assert_allclose(R3, R2, rtol=1e-5, atol=1e-8)
+    # except Exception as e:
+    #     pass
+    #     #print(e)
+    
+    try:
+        print("4444444444444444444444444444444444444", R3.shape, R4.shape)
+        np.testing.assert_allclose(R3, R4,  rtol=1e-5, atol=1e-8)
+    except Exception as e:
+        print(e)
+
+    print(are_tensors_approximately_equal(R3, R4))
+
+    # Calculate the MSE between the two tensors
+    mse = torch.mean((R3 - R4) ** 2)
+    # Check if the difference is insignificant or not
+    if mse.item() < 1e-10:
+        print("The two tensors are close and accurate enough for a deep learning project.")
+    else:
+        print("The two tensors are different.")
+    # print(are_tensors_approximately_equal(R3, R1), are_tensors_approximately_equal(R3, R2))
+    # contrast_count = 8
+    # class_num =  20
+    # N = class_num * contrast_count
+    # ts = []
+    # squares = contrast_count * contrast_count
+    
+    # for i in range(1, squares + 1):
+    #     tens = torch.ones(class_num) * i
+    #     a = torch.diag(tens)
+    #     #print(i, a.shape, end="\n\n")
+    #     ts.append(a)
+    # ts = [torch.cat(ts[s:s + contrast_count], dim=1) for s in range(0, len(ts), contrast_count)]
+    # # print(len(ts), ts[0].shape, end="\n\n")
+    # # print(*ts, sep="\n\n", end="\n**##########################***\n\n")
+    # sim = torch.cat(ts, dim=0)
+    # print(sim.shape)
+    # print(sim)
+
+    # out = get_diag(sim, class_num, contrast_count)
+    # print(sim)
+    # print(sim.shape)
+    # print(out.shape)
+    # print(out)
+
+    #  def get_diag(sim, class_num, contrast_count):
+    #         N = class_num * 2
+    #         #length = sim.shape[0]
+    #         # n_levels = contrast_count - 1
+    #         pairs = []
+    #         levs = [[] for _ in range(contrast_count)]
+    #         for level in range(1, contrast_count, 2):
+    
+    #             pdiag = torch.diag(sim, level * class_num)
+    #             ndiag = torch.diag(sim, -level * class_num)
+    #             pchunks = torch.split(pdiag, class_num)
+    #             nchunks = torch.split(ndiag, class_num)
+    #             k = 1
+    #             for i, (pos, neg) in enumerate(zip(pchunks, nchunks), start=1):
+    #                 levs[i].append(pos)
+    #                 levs[i + k].append(neg)
+    #                 k += 2
+    #         for lev_diags in levs:
+    #             pairs += lev_diags
+    #         pairs

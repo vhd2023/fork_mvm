@@ -1,6 +1,8 @@
 # import numpy as np
 import torch.nn as nn
 import torch
+torch.set_printoptions(precision=3, sci_mode=False)
+
 from torch.nn.functional import normalize
 import time
 import functools
@@ -9,6 +11,13 @@ import numpy as np
 
 # from train import timer
 # 14, 15, 18, 23, 24, and 27
+def log_it(*args, **kwargs):
+    with open("colog/logit==Loss===LOG=====instance-shapes.out", "a") as f:
+        print(*args, **kwargs, file=f)
+        print(*args, **kwargs)
+        info = torch.cuda.mem_get_info(device="cuda:0")
+        info = [bytes // (10 ** 6) for bytes in info]
+        print("####\t\t#### free gpu:", info[0], "Mb\t", "occupied:", info[1], "Mb", file=f)
 
 
 def timer(func):
@@ -164,7 +173,7 @@ class Network(nn.Module):
             truncation=True,
             max_length=32,
         )
-        del x
+        # del x
         mask = tokens["attention_mask"].to("cuda")
 
         if self.mlm_mix_head is not None:
@@ -178,23 +187,27 @@ class Network(nn.Module):
             output_hidden_states=False,
             return_dict=True,  # made it false #TODO
         )
-        del tokens
+        # del tokens
 
         # pooled = mean_pooling(model_output=model_output,
-        #                attention_mask=tokens['attention_mask'])
+        #
+        #                 attention_mask=tokens['attention_mask'])
         h = self.pooler(
             outputs=model_output,
             pooler_type=pooler_type,
             attention_mask=mask,
         )
-        del model_output
+        # del model_output
         torch.cuda.empty_cache()
 
         z = normalize(self.instance_projector(h), dim=1)
 
         c = self.cluster_projector(h)
+        # log_it(*c[:3].tolist(), c.shape, h.shape, sep='\n')
+        c = nn.functional.softmax(c, dim=1)
+        # log_it(*c[:3].tolist(), c.shape, h.shape, sep='\n')
+        # log_it("#" * 30)
 
-        
         return z, c, 0, 0
        
     def pooler(self, outputs, pooler_type, attention_mask):
