@@ -148,6 +148,7 @@ class Network(nn.Module):
         
     @timer
     def single_forward(self, x, pooler_type):
+        '''
         # print(len(x), x[0][0], type(x[0]), len(x[0]), type(x[0][0]), print(x[0][0]), sep='\n###')
         # print(x,end="\n" + 30 * "$")
         # @timer
@@ -199,15 +200,37 @@ class Network(nn.Module):
         )
         # del model_output
         torch.cuda.empty_cache()
+        '''
+            
+        torch.cuda.empty_cache()
+        tokens = self.tokenizer(
+            x,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=32,
+        ).to('cuda')
+        # del x
+        # mask = tokens["attention_mask"].to("cuda")
 
+        # tokens.input_ids = tokens.input_ids.to("cuda")
+
+        model_output = self.backbone(
+            **tokens,#.to("cuda"),
+            output_hidden_states=False,
+            return_dict=True,  # made it false #TODO
+        )
+        
+        h = self.pooler(
+            outputs=model_output,
+            pooler_type=pooler_type,
+            attention_mask=tokens["attention_mask"],
+        )
         z = normalize(self.instance_projector(h), dim=1)
 
         c = self.cluster_projector(h)
-        # log_it(*c[:3].tolist(), c.shape, h.shape, sep='\n')
         c = nn.functional.softmax(c, dim=1)
-        # log_it(*c[:3].tolist(), c.shape, h.shape, sep='\n')
-        # log_it("#" * 30)
-
+        
         return z, c, 0, 0
        
     def pooler(self, outputs, pooler_type, attention_mask):
@@ -387,13 +410,33 @@ class Network(nn.Module):
         return z_i, z_j, c_i, c_j, 0, 0
 
     # @timer
-    def forward_c(self, x):
-        h = self.backbone.encode(
+    def forward_c(self, x, pooler_type='avg'):
+        
+        torch.cuda.empty_cache()
+        tokens = self.tokenizer(
             x,
-            batch_size=len(x),
-            convert_to_numpy=False,
-            convert_to_tensor=True,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=32,
+        ).to('cuda')
+        # del x
+        # mask = tokens["attention_mask"].to("cuda")
+
+        # tokens.input_ids = tokens.input_ids.to("cuda")
+
+        model_output = self.backbone(
+            **tokens,#.to("cuda"),
+            output_hidden_states=False,
+            return_dict=True,  # made it false #TODO
         )
+        
+        h = self.pooler(
+            outputs=model_output,
+            pooler_type=pooler_type,
+            attention_mask=tokens["attention_mask"],
+        )
+
         c = self.cluster_projector(h)
         c = torch.nn.functional.softmax(c, dim=1)
         return c
@@ -405,15 +448,12 @@ class Network(nn.Module):
         for i in range(size):
             if pseudo_index[i]:
                 x.append(x_j[i])
-        h = self.backbone.encode(
-            x,
-            batch_size=len(x),
-            convert_to_numpy=False,
-            convert_to_tensor=True,
-        )
-        c = self.cluster_projector(h)
-        c = torch.nn.functional.softmax(c, dim=1)
-        return c
+        # h = self.backbone.encode(x, batch_size=len(x),
+        #                          convert_to_numpy=False,
+        #                          convert_to_tensor=True)
+        # c = self.cluster_projector(h)
+        # c = torch.nn.functional.softmax(c, dim=1)
+        return self.forward_c(x, pooler_type='avg')
 
     # @timer
     def forward_cluster(self, x):

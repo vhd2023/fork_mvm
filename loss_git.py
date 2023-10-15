@@ -38,34 +38,6 @@ class ContrastiveLoss(nn.Module):
         mask = mask.bool()
         return mask
 
-    def generate_pseudo_labels(self, c, class_num):
-        pseudo_label = -torch.ones(self.confidence_bs, dtype=torch.long).to(self.device)
-        tmp = torch.arange(0, self.confidence_bs).to(self.device)
-        with torch.no_grad():
-            prediction = c.argmax(dim=1)
-            confidence = c.max(dim=1).values
-            pseudo_per_class = math.ceil(self.confidence_bs / class_num * 0.5)
-            for i in range(class_num):
-                class_idx = (prediction == i)
-                confidence_class = confidence[class_idx]
-                num = min(confidence_class.shape[0], pseudo_per_class)
-                confident_idx = torch.argsort(-confidence_class)
-                for j in range(num):
-                    idx = tmp[class_idx][confident_idx[j]]
-                    pseudo_label[idx] = i
-        return pseudo_label
-
-
-    def forward_weighted_ce(self, c_, pseudo_label, class_num):
-        idx, counts = torch.unique(pseudo_label, return_counts=True)
-        freq = pseudo_label.shape[0] / counts.float()
-        weight = torch.ones(class_num).to(pseudo_label.device)
-        weight[idx] = freq
-        criterion = nn.CrossEntropyLoss(weight=weight)
-        loss_ce = criterion(c_, pseudo_label)
-        return loss_ce
-
-
 
     def my_diagonal_extractor(self, sim, class_num, contrast_count):
         #N = class_num * 2
@@ -432,6 +404,87 @@ class ContrastiveLoss(nn.Module):
         instance_loss = instance_loss.view(anchor_count, batch_size).mean()
         return instance_loss, cluster_loss + ne_loss
 
+
+    def generate_pseudo_labels(self, c, class_num):
+        pseudo_label = -torch.ones(self.confidence_bs, dtype=torch.long).to(self.device)
+        tmp = torch.arange(0, self.confidence_bs).to(self.device)
+        with torch.no_grad():
+            prediction = c.argmax(dim=1)
+            confidence = c.max(dim=1).values
+            pseudo_per_class = math.ceil(self.confidence_bs / class_num * 0.5)
+            for i in range(class_num):
+                class_idx = (prediction == i)
+                confidence_class = confidence[class_idx]
+                num = min(confidence_class.shape[0], pseudo_per_class)
+                confident_idx = torch.argsort(-confidence_class)
+                for j in range(num):
+                    idx = tmp[class_idx][confident_idx[j]]
+                    pseudo_label[idx] = i
+        return pseudo_label
+
+    def forward_instance_elim(self, z_i, z_j, pseudo_labels):
+        batch_size =z_i.shape[0]
+        # instance loss
+        invalid_index = (pseudo_labels == -1)
+        mask = torch.eq(pseudo_labels.view(-1, 1),
+                        pseudo_labels.view(1, -1)).to(z_i.device)
+        mask[invalid_index, :] = False
+        mask[:, invalid_index] = False
+        mask_eye = torch.eye(batch_size).float().to(z_i.device)
+        mask &= (~(mask_eye.bool()).to(z_i.device))
+        mask = mask.float()
+
+        contrast_count = 2
+        contrast_feature = torch.cat((z_i, z_j), dim=0)
+
+        anchor_feature = contrast_feature
+        anchor_count = contrast_count
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature_ins)
+        # for numeriecal stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        # mask_with_eye = mask | mask_eye.bool()
+        # mask = torch.cat(mask)
+        mask = mask.repeat(anchor_count, contrast_count)
+        mask_eye = mask_eye.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 1,
+            torch.arange(self.batch_size * anchor_count).view(-1, 1).to(
+                z_i.device), 0)
+        logits_mask *= (1 - mask)
+        mask_eye = mask_eye * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask_eye * log_prob).sum(1) / mask_eye.sum(1)
+
+        # loss
+        instance_loss = -mean_log_prob_pos
+        instance_loss = instance_loss.view(anchor_count,
+                                           batch_size).mean()
+
+        return instance_loss
+
+    def forward_weighted_ce(self, c_, pseudo_label, class_num):
+        idx, counts = torch.unique(pseudo_label, return_counts=True)
+        freq = pseudo_label.shape[0] / counts.float()
+        weight = torch.ones(class_num).to(pseudo_label.device)
+        weight[idx] = freq
+        criterion = nn.CrossEntropyLoss(weight=weight)
+        loss_ce = criterion(c_, pseudo_label)
+        return loss_ce
+
+
     def forward(self, z_i, z_j, c_i, c_j):
         batch_size = z_i.shape[0]
         device = z_i.device
@@ -518,60 +571,6 @@ class ContrastiveLoss(nn.Module):
         return instance_loss, cluster_loss + ne_loss
 
 
-    def forward_instance_elim(self, z_i, z_j, pseudo_labels):
-        # instance loss
-        invalid_index = (pseudo_labels == -1)
-        mask = torch.eq(pseudo_labels.view(-1, 1),
-                        pseudo_labels.view(1, -1)).to(z_i.device)
-        mask[invalid_index, :] = False
-        mask[:, invalid_index] = False
-        mask_eye = torch.eye(self.batch_size).float().to(z_i.device)
-        mask &= (~(mask_eye.bool()).to(z_i.device))
-        mask = mask.float()
-
-        contrast_count = 2
-        contrast_feature = torch.cat((z_i, z_j), dim=0)
-
-        anchor_feature = contrast_feature
-        anchor_count = contrast_count
-
-        # compute logits
-        anchor_dot_contrast = torch.div(
-            torch.matmul(anchor_feature, contrast_feature.T),
-            self.temperature_ins)
-        # for numerical stability
-        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
-        logits = anchor_dot_contrast - logits_max.detach()
-
-        # tile mask
-        # mask_with_eye = mask | mask_eye.bool()
-        # mask = torch.cat(mask)
-        mask = mask.repeat(anchor_count, contrast_count)
-        mask_eye = mask_eye.repeat(anchor_count, contrast_count)
-        # mask-out self-contrast cases
-        logits_mask = torch.scatter(
-            torch.ones_like(mask), 1,
-            torch.arange(self.batch_size * anchor_count).view(-1, 1).to(
-                z_i.device), 0)
-        logits_mask *= (1 - mask)
-        mask_eye = mask_eye * logits_mask
-
-        # compute log_prob
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-
-        # compute mean of log-likelihood over positive
-        mean_log_prob_pos = (mask_eye * log_prob).sum(1) / mask_eye.sum(1)
-#60379975  5264 1293
-        # loss
-        instance_loss = -mean_log_prob_pos
-        instance_loss = instance_loss.view(anchor_count,
-                                        self.batch_size).mean()
-
-        return instance_loss
-
-
-
 
 '''
 
@@ -602,7 +601,7 @@ class ContrastiveLoss(nn.Module):
                     idx = tmp[class_idx][confident_idx[j]]
                     pseudo_label[idx] = i
         return pseudo_label
-
+        
 
     def forward_weighted_ce(self, c_, pseudo_label, class_num):
         idx, counts = torch.unique(pseudo_label, return_counts=True)
